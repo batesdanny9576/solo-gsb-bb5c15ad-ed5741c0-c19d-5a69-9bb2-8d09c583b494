@@ -8,7 +8,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .database import get_conn_ctx, init_db
-from .routers import certificates, edges, export, instruments, submissions, trace
+from .routers import (
+    calibration,
+    certificates,
+    edges,
+    export,
+    instruments,
+    submissions,
+    trace,
+)
 from .seed import DEMO_AT, seed_demo
 
 
@@ -46,6 +54,7 @@ app.include_router(certificates.router)
 app.include_router(edges.router)
 app.include_router(submissions.router)
 app.include_router(trace.router)
+app.include_router(calibration.router)
 app.include_router(export.router)
 app.include_router(export.admin_router)
 
@@ -75,6 +84,14 @@ def root():
                 "POST /api/assessments/common-traceability"
                 "（多仪器共同溯源核查，只读，不写库）"
             ),
+            "calibration_slot_query": (
+                "GET /api/calibration-slots?instrument=&start=&end=&duration_seconds="
+            ),
+            "calibration_booking": (
+                "POST /api/calibration-bookings"
+                "（同一写事务内重查占用与证书截止，冲突 409）"
+            ),
+            "calibration_booking_list": "GET /api/calibration-bookings?instrument=",
         },
         "demo_query_time": DEMO_AT,
     }

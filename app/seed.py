@@ -114,3 +114,22 @@ def seed_demo(conn: sqlite3.Connection) -> None:
     ]
     for e in edges:
         crud.upsert_edge(conn, e)
+
+    # ---------- 校准工位预约（单工位，半开区间 [start_at, end_at)） ----------
+    # 为数显卡尺 INST-W1 预置一条已确认预约，演示空档查询时工位已被占用；
+    # 其起点 2026-06-20 在唯一链 CW1-1 -> CR1-1 -> CG-1 有效期内，
+    # 结束早于起点证书 CW1-1 的到期时刻 2027-01-01T00:00:00Z。
+    from .booking import insert_booking
+
+    insert_booking(
+        conn,
+        booking_id="BK-DEMO-20260620-W1",
+        instrument_code="INST-W1",
+        start_at="2026-06-20T09:00:00Z",
+        end_at="2026-06-20T10:00:00Z",
+        duration_seconds=3600,
+        certificate_id="CW1-1",
+        certificate_valid_until="2027-01-01T00:00:00Z",
+        note="演示数据：数显卡尺例行校准",
+        created_at=DEMO_AT,
+    )

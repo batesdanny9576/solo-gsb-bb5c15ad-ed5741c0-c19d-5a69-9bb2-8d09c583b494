@@ -54,6 +54,25 @@ CREATE TABLE IF NOT EXISTS trace_edges (
 
 CREATE INDEX IF NOT EXISTS idx_edge_child ON trace_edges(child_cert_id);
 CREATE INDEX IF NOT EXISTS idx_edge_parent ON trace_edges(parent_cert_id);
+
+-- 校准工位预约：全实验室仅有“单个工位”，占用一律按半开区间 [start_at, end_at)
+-- 计算（相接但不重叠，如 [09,10) 与 [10,11) 不冲突）；预约只与仪器相关于
+-- 溯源截止，工位占用不分仪器。certificate_valid_until 为确认时刻起点证书
+-- valid_until 的快照，重查截止时以库内证书现值为准。
+CREATE TABLE IF NOT EXISTS calibration_bookings (
+    id               TEXT PRIMARY KEY,
+    instrument_code  TEXT NOT NULL REFERENCES instruments(code),
+    start_at         TEXT NOT NULL,
+    end_at           TEXT NOT NULL,
+    duration_seconds INTEGER NOT NULL,
+    certificate_id   TEXT NOT NULL,
+    certificate_valid_until TEXT NOT NULL,
+    note             TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_booking_instrument ON calibration_bookings(instrument_code);
+CREATE INDEX IF NOT EXISTS idx_booking_interval ON calibration_bookings(start_at, end_at);
 """
 
 
@@ -61,9 +80,12 @@ def _connect() -> sqlite3.Connection:
     directory = os.path.dirname(DB_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=5)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 预约确认在同一写事务（BEGIN IMMEDIATE）内重查占用并写入，
+    # 给写锁竞争留出等待窗口，避免立即 SQLITE_BUSY。
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 

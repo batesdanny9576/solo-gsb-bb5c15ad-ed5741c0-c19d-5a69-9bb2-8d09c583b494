@@ -791,6 +791,50 @@ def _nonparticipation(
     return None
 
 
+def unique_chain_gate(
+    conn: sqlite3.Connection,
+    instrument_code: str,
+    at: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """在指定时点要求该仪器存在“唯一且校验通过”的溯源链。
+
+    供校准工位预约等需要确定性溯源保证的业务复用：仅当报告
+    ``resolution=unique`` 且零 ERROR（即 ``valid=true``）时放行，
+    返回起点证书 id 与其有效期截止 ``valid_until``；其余情况
+    （仪器存在但无有效起点/起点不唯一/多候选/断裂/校验失败）
+    返回 ``(reason_code, reason, report)``，由调用方向用户说明原因。
+    仪器不存在由调用方（KeyError）自行处理为 404。
+    """
+    at_naive = to_utc_naive(at) if at else datetime.utcnow()
+    at_s = fmt(at_naive)
+    cat = Catalog(conn)
+    if instrument_code not in cat.instruments:
+        raise KeyError(instrument_code)
+
+    report = _build_report(cat, instrument_code, at_s)
+    rejection = _nonparticipation(instrument_code, report, at_s)
+    if rejection is not None:
+        reason_code, reason = rejection
+        return {
+            "ok": False,
+            "at": at_s,
+            "reason_code": reason_code,
+            "reason": reason,
+            "report": report,
+        }
+    start_node = report["active_chain"]["nodes"][0]
+    start_cert_id = start_node["certificate_id"]
+    return {
+        "ok": True,
+        "at": at_s,
+        "reason_code": None,
+        "reason": None,
+        "report": report,
+        "start_certificate_id": start_cert_id,
+        "certificate_valid_until": start_node["valid_until"],
+    }
+
+
 def build_common_trace_report(
     conn: sqlite3.Connection,
     at: Optional[datetime],

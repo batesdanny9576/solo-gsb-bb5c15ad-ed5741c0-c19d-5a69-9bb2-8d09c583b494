@@ -59,7 +59,7 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（51 个用例）
+pytest -q        # 运行测试（79 个用例）
 ```
 
 > 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式。
@@ -89,6 +89,20 @@ trace_edges（父子溯源边）
   根节点不再向上溯源。
 - 同一子证书可挂多条父边，因此同一时点可能枚举出多条候选链。
 
+```
+calibration_bookings（校准工位预约；全实验室单个工位，半开区间占用）
+    id (PK)、instrument_code(FK→instruments)
+    start_at、end_at（半开占用 [start_at, end_at)，UTC）
+    duration_seconds
+    certificate_id、certificate_valid_until（确认时起点证书及其到期时刻快照）
+    note、created_at
+```
+
+- 工位占用**不分仪器**：所有预约共用同一张表；冲突按半开区间
+  `b.start < end AND b.end > start` 判定，相接但不重叠不冲突。
+- 预约确认时在同一写事务内重查溯源链与占用；查询/确认要求该仪器在
+  起点存在唯一且校验通过的溯源链，且 `end_at <= 起点证书 valid_until`。
+
 ---
 
 ## 四、API 一览
@@ -106,6 +120,9 @@ trace_edges（父子溯源边）
 | **GET** | **`/api/trace/{instrument}?at=`** | **链路查询：重建唯一证书链** |
 | **GET** | **`/api/reports/{instrument}?at=`** | **校验报告（冲突明细）** |
 | **GET** | **`/api/coverage/{instrument}?start=&end=`** | **仪器时间窗覆盖查询：按有效期边界输出状态区段** |
+| **GET** | **`/api/calibration-slots?instrument=&start=&end=&duration_seconds=`** | **校准工位空档查询：单工位半开占用，返回时间窗内最早可用时段** |
+| **POST** | **`/api/calibration-bookings`** | **确认校准工位预约（同一写事务内重查占用与证书截止，冲突 409）** |
+| **GET** | **`/api/calibration-bookings?instrument=`** | **预约列表（可按仪器筛选）** |
 | **GET** | **`/api/export/{instrument}?at=`** | **JSON 导出（attachment 下载）** |
 | **POST** | **`/api/assessments/certificate-deactivation`** | **证书停用影响评估（dry-run，不写库）** |
 | **POST** | **`/api/assessments/common-traceability`** | **批次共同溯源核查：多仪器唯一有效链求最近共同证书（只读，不写库）** |
@@ -343,6 +360,109 @@ curl -G "http://localhost:8000/api/coverage/INST-T1" \
 - 内置演示数据中，热电偶 `INST-T1` 在 2025 年夏季存在证书断档，
   可直接用本节开头的 curl 观察“有效 → 断档（`INTERVAL_GAP` /
   `NO_ACTIVE_CERTIFICATE`）→ 恢复”的分段效果。
+
+#### 4.2）校准工位预约（GET /api/calibration-slots + POST /api/calibration-bookings）
+
+实验室只有**单个校准工位**（所有仪器共用一份占用），占用一律按
+**半开区间 `[start_at, end_at)`** 计算：相接但不重叠的两段（如
+`[09:00,10:00)` 与 `[10:00,11:00)`）互不冲突。
+
+**① 查询最早可用时段（只读）。** 输入仪器、UTC 起止时间与所需时长（秒）：
+
+```bash
+curl -G "http://localhost:8000/api/calibration-slots" \
+  --data-urlencode "instrument=INST-W1" \
+  --data-urlencode "start=2026-06-20T00:00:00Z" \
+  --data-urlencode "end=2026-06-21T00:00:00Z" \
+  --data-urlencode "duration_seconds=3600"
+```
+
+服务端：
+
+1. 在**查询起点**判定该仪器是否存在**唯一且校验通过**的溯源链
+   （复用 `/api/reports` 同一引擎：`resolution=unique` 且零 ERROR 才放行，
+   多候选链绝不任取一条）。链不可用（无有效证书 / 起点不唯一 / 多候选 /
+   断裂 / 校验失败）时 `slot=null`，`reason_code=TRACEABILITY_CHAIN_UNAVAILABLE`，
+   `chain_reason_code` 给出细分原因，完整证据见响应内的 `trace_report`；
+2. 预约必须在该**唯一有效链起点证书到期前结束**（`end <= valid_until`），
+   搜索窗右端按证书截止裁剪（`search_window_end`），到期前放不下时
+   `reason_code=CERTIFICATE_DEADLINE_TOO_EARLY`；
+3. 用与搜索窗半开相交的既有预约（`busy`，单工位、不分仪器）贪心求
+   **最早**能容纳所需时长的空档；窗内放不下时
+   `reason_code=NO_FREE_SLOT_IN_WINDOW`（查询窗本身短于时长返回 422）。
+
+```jsonc
+{
+  "instrument": "INST-W1",
+  "window_start": "2026-06-20T00:00:00Z",
+  "window_end": "2026-06-21T00:00:00Z",
+  "duration_seconds": 3600,
+  "traceability_at": "2026-06-20T00:00:00Z",   // 链判定时点（= 查询起点）
+  "traceability_available": true,
+  "certificate_id": "CW1-1",                   // 唯一有效链的起点证书
+  "certificate_valid_until": "2027-01-01T00:00:00Z",
+  "search_window_start": "2026-06-20T00:00:00Z",
+  "search_window_end": "2026-06-21T00:00:00Z", // 受证书截止裁剪后的实际搜索右端
+  "slot": {                                     // 最早可用时段（半开）
+    "start": "2026-06-20T00:00:00Z",
+    "end": "2026-06-20T01:00:00Z",
+    "ends_by_certificate_valid_until": true
+  },
+  "busy": [ /* 与搜索窗半开相交的既有预约：booking_id/instrument_code/start_at/end_at */ ],
+  "trace_report": { /* 查询起点的完整溯源报告，结构同 /api/reports，便于解释原因 */ }
+}
+```
+
+> 演示库已预置一条 `INST-W1` 在 `2026-06-20T09:00:00Z ~ 10:00:00Z` 的占用，
+> 用 `start=...T09:00:00Z` 查询可看到空档被它推后到 `10:00:00Z`（半开相接）。
+
+**② 确认预约（写事务，冲突 409）。** 传入仪器、预约起点与时长（结束由
+服务端按 `start + duration_seconds` 计算）。服务端在**同一写事务**
+（`BEGIN IMMEDIATE`）内**重新检查**（不沿用 GET 的旧结果）：仪器存在 →
+预约起点唯一有效链仍成立 → 结束不晚于起点证书 `valid_until` → 单工位
+在该半开区间无占用；任一条件不成立即返回 **409** 并整体回滚（绝不写入），
+全部成立才在同一事务内原子写入 SQLite：
+
+```bash
+curl -X POST http://localhost:8000/api/calibration-bookings \
+  -H 'Content-Type: application/json' -d '{
+    "instrument_code": "INST-W1",
+    "start": "2026-06-20T11:00:00Z",
+    "duration_seconds": 1800,
+    "note": "例行校准"
+  }'
+# 201
+# {"id":"BK-20260924-xxxxxxxxxxxx", "instrument_code":"INST-W1",
+#  "start_at":"2026-06-20T11:00:00Z", "end_at":"2026-06-20T11:30:00Z",
+#  "duration_seconds":1800, "certificate_id":"CW1-1",
+#  "certificate_valid_until":"2027-01-01T00:00:00Z", "note":"例行校准", ...}
+```
+
+409 响应体带机器可读 `code`、中文 `message` 与结构化 `detail`：
+
+| `detail.code` | 触发条件 |
+| --- | --- |
+| `INSTRUMENT_NOT_FOUND` | 仪器在确认时已不存在 |
+| `TRACEABILITY_CHAIN_UNAVAILABLE` | 预约起点唯一有效链不成立（`detail.reason_code` 细分，附 `trace_report`） |
+| `BOOKING_ENDS_AFTER_CERT_EXPIRY` | 结束晚于起点证书有效期截止（附两者时刻） |
+| `STATION_OCCUPIED` | 单工位该半开区间已有预约（`detail.conflicting_bookings` 给出全部冲突预约） |
+
+> 半开语义下，新预约起点恰等于既有预约结束点（如 `10:00:00Z` 紧接
+> `[09:00,10:00)`）不冲突、可以确认；结束时刻**恰等于**证书
+> `valid_until` 同样允许（到期前结束）。写事务以 `BEGIN IMMEDIATE`
+> 立即取写锁，并发确认同一时段时恰有一个成功，其余在事务内重查到
+> 已提交占用后返回 409，不会产生重叠预约。
+
+**③ 查询预约。** 按仪器查询（留空 `instrument` 则返回全部，按起点升序）：
+
+```bash
+curl "http://localhost:8000/api/calibration-bookings?instrument=INST-W1"
+curl "http://localhost:8000/api/calibration-bookings"
+```
+
+入参/状态码：时间均按 UTC（建议 `...Z`）；`duration_seconds` 须为正整数
+（否则 422）；`start` 不早于 `end`、时长不超过窗长，否则 422；
+仪器不存在 GET 返回 404，POST 在写事务内确认时返回 409。
 
 ### 5）证书停用影响评估（dry-run 模拟）
 
@@ -696,6 +816,42 @@ curl -X POST http://localhost:8000/api/assessments/common-traceability \
 #   INST-B1 -> ALL_CHAINS_FAILED_CHECKS
 ```
 
+校准工位预约示例（单工位、半开占用、起点证书截止）：
+
+```bash
+# 空档查询：演示库已占用 INST-W1 的 2026-06-20 09:00~10:00（半开）
+curl -G "http://localhost:8000/api/calibration-slots" \
+  --data-urlencode "instrument=INST-W1" \
+  --data-urlencode "start=2026-06-20T09:00:00Z" \
+  --data-urlencode "end=2026-06-20T12:00:00Z" \
+  --data-urlencode "duration_seconds=3600"
+# slot: 2026-06-20T10:00:00Z ~ 11:00:00Z（09~10 被占用，半开相接后最早空档）
+# certificate_id=CW1-1, certificate_valid_until=2027-01-01T00:00:00Z
+
+# 确认预约（结束 11:00，恰在既有占用结束点，半开不冲突）
+curl -X POST http://localhost:8000/api/calibration-bookings \
+  -H 'Content-Type: application/json' -d '{
+    "instrument_code": "INST-W1",
+    "start": "2026-06-20T10:00:00Z",
+    "duration_seconds": 3600
+  }'
+# 201
+
+# 链不可用的仪器（INST-T1 断裂 / INST-P1 多候选 / INST-B1 摘要篡改）
+# 空档查询 slot=null 并说明原因：
+curl -G "http://localhost:8000/api/calibration-slots" \
+  --data-urlencode "instrument=INST-P1" \
+  --data-urlencode "start=2026-06-20T09:00:00Z" \
+  --data-urlencode "end=2026-06-20T12:00:00Z" \
+  --data-urlencode "duration_seconds=3600"
+# reason_code=TRACEABILITY_CHAIN_UNAVAILABLE,
+# chain_reason_code=MULTIPLE_VALID_CHAINS（多候选，绝不任取一条），
+# trace_report 给出完整可解释冲突
+
+# 按仪器查询已确认预约
+curl "http://localhost:8000/api/calibration-bookings?instrument=INST-W1"
+```
+
 ## 七、溯源算法说明
 
 1. 取目标仪器在 `at` 生效（`valid_from <= at <= valid_until`）的证书作为起点；
@@ -719,6 +875,13 @@ curl -X POST http://localhost:8000/api/assessments/common-traceability \
    按“各链距离最大值最小 → 距离总和最小 → 证书 ID 字典序末位”排序选出
    最近共同证书，并从各链截取到该证书（含）为止的子链与距离；交集为空时
    明确返回无共同证书。全程不写入业务数据。
+9. 校准工位预约：全实验室单个工位，占用按半开区间 `[start, end)` 计算。
+   GET 在查询起点复用步骤 1~5 要求“唯一成链且零 ERROR”，取起点证书
+   `valid_until` 作为预约必须结束的截止并裁剪搜索窗，再以与搜索窗
+   半开相交的既有预约（不分仪器）贪心求最早可容纳所需时长的空档。
+   POST 在 `BEGIN IMMEDIATE` 同一写事务内重查仪器、溯源链、证书截止与
+   半开占用，任一不满足即 409 回滚，全部满足才原子写入；因此并发确认
+   同一时段恰有一个成功，不产生重叠预约。
 
 ## 八、项目结构
 
@@ -730,16 +893,21 @@ app/
   crud.py            upsert 与写入期校验
   engine.py          溯源链重建（DFS）、校验规则、停用影响模拟（内存 Catalog）、
                      仪器时间窗覆盖分段（边界点 + 开区间内部采样）、
-                     批次共同溯源核查（共同证书选举 + 子链截取）
-  seed.py            五场景演示数据
+                     批次共同溯源核查（共同证书选举 + 子链截取）、
+                     unique_chain_gate（唯一有效链门禁，工位预约复用）
+  booking.py         校准工位预约：单工位半开占用查询、最早空档贪心、
+                     写事务内重查确认（409 冲突）与预约持久化/列表
+  seed.py            五场景演示数据 + 1 条校准工位演示预约
   routers/           instruments / certificates / edges /
                      submissions（批量提交 + preflight 预检）/
                      trace(report + 时间窗覆盖 + 停用影响评估 + 批次共同溯源核查) /
+                     calibration（工位空档 GET + 预约确认 POST + 预约列表 GET）/
                      export / admin
 tests/test_trace.py          10 个接口级测试
 tests/test_preflight.py      11 个批量提交预检测试
 tests/test_deactivation.py   8 个停用影响评估测试
 tests/test_coverage.py       10 个仪器时间窗覆盖查询测试
 tests/test_common_trace.py   12 个批次共同溯源核查测试
+tests/test_calibration.py    28 个校准工位预约测试
 Dockerfile · docker-compose.yml · requirements.txt
 ```
