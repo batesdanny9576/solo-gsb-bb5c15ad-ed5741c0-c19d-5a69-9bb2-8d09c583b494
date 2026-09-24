@@ -425,6 +425,62 @@ def build_report(
     return _build_report(Catalog(conn), instrument_code, at_s)
 
 
+def get_unique_chain_start(
+    conn: sqlite3.Connection,
+    instrument_code: str,
+    at: datetime,
+) -> dict[str, Any]:
+    """返回仪器在 ``at`` 时点“唯一有效溯源链”的起点证书及其到期时间。
+
+    预约约束的依据是：查询起点（at）该仪器必须恰有一条到国家基准且
+    校验通过（resolution=unique 且零 ERROR）的溯源链；链上起点证书
+    （该仪器自身在该时点有效的证书）的 ``valid_until`` 即“预约必须在其前
+    结束”的截止时间。链不唯一、断裂、起点证书缺失/多重或唯一链校验失败
+    时返回 available=False 与可解释原因；仪器不存在抛 KeyError。
+    """
+    at_naive = to_utc_naive(at)
+    at_s = fmt(at_naive)
+    if get_instrument(conn, instrument_code) is None:
+        raise KeyError(instrument_code)
+
+    cat = Catalog(conn)
+    report = _build_report(cat, instrument_code, at_s)
+    rejection = _nonparticipation(instrument_code, report, at_s)
+    if rejection is not None:
+        reason_code, reason = rejection
+        return {
+            "available": False,
+            "at": at_s,
+            "reason_code": reason_code,
+            "reason": reason,
+            "resolution": report["resolution"],
+            "valid": report["valid"],
+            "starts": report["starts"],
+            "conflicts": report["conflicts"],
+            "error_count": report["error_count"],
+            "warning_count": report["warning_count"],
+        }
+
+    start_id = report["active_chain"]["nodes"][0]["certificate_id"]
+    start_cert = cat.certs[start_id]
+    return {
+        "available": True,
+        "at": at_s,
+        "resolution": report["resolution"],
+        "valid": True,
+        "starts": report["starts"],
+        "start_certificate_id": start_id,
+        "start_cert_number": start_cert["cert_number"],
+        "certificate_valid_until": start_cert["valid_until"],
+        "chain_certificate_ids": [
+            n["certificate_id"] for n in report["active_chain"]["nodes"]
+        ],
+        "conflicts": report["conflicts"],
+        "error_count": report["error_count"],
+        "warning_count": report["warning_count"],
+    }
+
+
 def _active_starts(cat: Catalog, instrument_code: str, at_s: str) -> list[str]:
     return sorted(
         c["id"]

@@ -12,6 +12,9 @@ from typing import Iterator
 
 DB_PATH = os.getenv("TRACE_DB_PATH", "/data/traceability.db")
 
+# 写事务（BEGIN IMMEDIATE）等待锁的最长时间，避免并发预约直接报 database is locked
+BUSY_TIMEOUT_MS = 5000
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS instruments (
     code        TEXT PRIMARY KEY,
@@ -54,6 +57,28 @@ CREATE TABLE IF NOT EXISTS trace_edges (
 
 CREATE INDEX IF NOT EXISTS idx_edge_child ON trace_edges(child_cert_id);
 CREATE INDEX IF NOT EXISTS idx_edge_parent ON trace_edges(parent_cert_id);
+
+-- 校准工位预约：全实验室共用单一工位（station_code 固定 CAL-STATION-01），
+-- 占用区间按半开区间 [start_at, end_at) 判定，首尾相接不算冲突。
+-- start_certificate_id / certificate_valid_until 记录确认时刻的溯源链
+-- 起点证书及其到期时间，作为“预约在到期前结束”约束的持久化证据。
+CREATE TABLE IF NOT EXISTS calibration_bookings (
+    id              TEXT PRIMARY KEY,
+    station_code    TEXT NOT NULL,
+    instrument_code TEXT NOT NULL REFERENCES instruments(code),
+    start_at        TEXT NOT NULL,
+    end_at          TEXT NOT NULL,
+    duration_minutes INTEGER NOT NULL,
+    start_certificate_id    TEXT NOT NULL REFERENCES certificates(id),
+    certificate_valid_until TEXT NOT NULL,
+    note            TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_booking_instrument
+    ON calibration_bookings(instrument_code);
+CREATE INDEX IF NOT EXISTS idx_booking_station_interval
+    ON calibration_bookings(station_code, start_at, end_at);
 """
 
 
@@ -61,7 +86,9 @@ def _connect() -> sqlite3.Connection:
     directory = os.path.dirname(DB_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(
+        DB_PATH, check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -106,6 +133,26 @@ def get_preflight_conn() -> Iterator[sqlite3.Connection]:
         yield conn
     finally:
         conn.rollback()
+        conn.close()
+
+
+@contextmanager
+def get_write_tx() -> Iterator[sqlite3.Connection]:
+    """写事务专用连接：进入即 ``BEGIN IMMEDIATE`` 立即取得 SQLite 写锁。
+
+    预约确认需要在“同一写事务”内先重查占用与证书截止、再插入预约，
+    以 IMMEDIATE 方式开启事务可保证两个并发预约在占用检查阶段即被串行化，
+    杜绝各自读到不冲突、随后双双写入的竞态。正常退出 COMMIT，异常 ROLLBACK。
+    """
+    conn = _connect()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
 
 

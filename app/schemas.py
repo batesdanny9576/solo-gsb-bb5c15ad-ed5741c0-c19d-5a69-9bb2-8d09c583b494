@@ -562,3 +562,144 @@ class CommonTraceReport(BaseModel):
         description="逐台仪器的参与结果：子链、距离或不可参与原因",
     )
     statistics: dict = Field(default_factory=dict)
+
+
+# ---------- 校准工位预约 ----------
+
+# 全实验室共用的唯一校准工位编码
+CALIBRATION_STATION_CODE = "CAL-STATION-01"
+
+
+class CalibrationBookingIn(BaseModel):
+    """校准工位预约请求：仪器 + UTC 起始时刻 + 所需时长（分钟）。"""
+
+    instrument_code: str = Field(
+        ..., min_length=1, description="待校准仪器编码"
+    )
+    start_at: datetime = Field(
+        ..., description="预约起始时刻（UTC，含）；占用区间 [start_at, end_at)"
+    )
+    duration_minutes: int = Field(
+        ..., gt=0, description="所需时长（正整数分钟）；结束时刻 = 起始 + 时长"
+    )
+    note: str = ""
+
+
+class CalibrationBookingOut(BaseModel):
+    id: str
+    station_code: str
+    instrument_code: str
+    start_at: datetime = Field(..., description="预约起始时刻（UTC，含）")
+    end_at: datetime = Field(..., description="预约结束时刻（UTC，不含）")
+    duration_minutes: int
+    start_certificate_id: str = Field(
+        ..., description="确认时刻该仪器唯一有效溯源链的起点证书 id"
+    )
+    certificate_valid_until: datetime = Field(
+        ..., description="确认时刻起点证书的到期时间（预约须在其前结束）"
+    )
+    note: str
+    created_at: datetime
+
+
+class SlotDeadline(BaseModel):
+    start_certificate_id: str = Field(
+        ..., description="查询起点该仪器唯一有效溯源链的起点证书 id"
+    )
+    start_cert_number: str
+    certificate_valid_until: datetime = Field(
+        ...,
+        description="起点证书到期时间；任何预约区间的结束时刻不得晚于它",
+    )
+    chain_certificate_ids: List[str] = Field(
+        default_factory=list,
+        description="查询起点该仪器唯一有效链（叶子→根）的证书 id 序列",
+    )
+
+
+class SlotTraceability(BaseModel):
+    at: datetime = Field(..., description="溯源链评估时点（=查询窗起点，UTC）")
+    available: bool = Field(
+        ...,
+        description="查询起点是否存在唯一有效且校验通过的溯源链",
+    )
+    resolution: Optional[str] = Field(
+        None, description="unique | ambiguous | broken（链不可用时仍给出）"
+    )
+    valid: bool
+    reason_code: Optional[str] = Field(
+        None,
+        description=(
+            "链不可用原因码（链可用时为 null）：NO_ACTIVE_CERTIFICATE | "
+            "MULTIPLE_ACTIVE_CERTIFICATES | MULTIPLE_VALID_CHAINS | "
+            "CHAIN_BROKEN | ALL_CHAINS_FAILED_CHECKS | CHAIN_VALIDATION_FAILED"
+        ),
+    )
+    reason: Optional[str] = Field(None, description="链不可用的中文原因说明")
+    starts: List[str] = Field(
+        default_factory=list, description="查询起点有效的起点证书 id"
+    )
+
+
+class SlotBusyInterval(BaseModel):
+    booking_id: str
+    instrument_code: str = Field(
+        ..., description="占用该工位的预约所属仪器（全实验室共用工位）"
+    )
+    start_at: datetime = Field(..., description="占用起点（UTC，含）")
+    end_at: datetime = Field(..., description="占用终点（UTC，不含）")
+
+
+class CalibrationSlot(BaseModel):
+    start_at: datetime = Field(..., description="可预约时段起点（UTC，含）")
+    end_at: datetime = Field(..., description="可预约时段终点（UTC，不含）")
+    duration_minutes: int
+
+
+class CalibrationSlotsResult(BaseModel):
+    station_code: str
+    instrument: str
+    window_start: datetime = Field(..., description="查询窗起点（UTC，含）")
+    window_end: datetime = Field(..., description="查询窗终点（UTC，不含）")
+    duration_minutes: int
+    interval_semantics: str = Field(
+        ...,
+        description="占用与查询窗均按半开区间 [start, end) 判定，首尾相接不冲突",
+    )
+    traceability: SlotTraceability
+    deadline: Optional[SlotDeadline] = Field(
+        None,
+        description=(
+            "唯一有效链起点证书的到期约束；链不可用时为 null，"
+            "此时 available=false、slot=null"
+        ),
+    )
+    effective_window_end: Optional[datetime] = Field(
+        None,
+        description=(
+            "实际搜索上限 = min(查询窗终点, 起点证书到期时间)；"
+            "链不可用时为 null"
+        ),
+    )
+    busy_intervals: List[SlotBusyInterval] = Field(
+        default_factory=list,
+        description="时间窗内单个工位的全部占用（按起始时刻升序，半开区间）",
+    )
+    available: bool = Field(
+        ...,
+        description=(
+            "是否存在可用时段：需同时满足溯源链可用且最早时段在窗口内、"
+            "且结束不晚于起点证书到期时间"
+        ),
+    )
+    reason_code: Optional[str] = Field(
+        None,
+        description=(
+            "不可用机器码（可用时为 null）：TRACE_CHAIN_UNAVAILABLE | "
+            "NO_AVAILABLE_SLOT_IN_WINDOW"
+        ),
+    )
+    reason: Optional[str] = Field(None, description="不可用的中文原因说明")
+    slot: Optional[CalibrationSlot] = Field(
+        None, description="时间窗内最早可用时段；不可用时为 null"
+    )

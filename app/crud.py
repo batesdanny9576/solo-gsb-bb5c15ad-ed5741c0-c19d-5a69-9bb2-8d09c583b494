@@ -477,6 +477,7 @@ def preflight(
 def reset(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
+        DELETE FROM calibration_bookings;
         DELETE FROM trace_edges;
         DELETE FROM certificates;
         DELETE FROM instruments;
